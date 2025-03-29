@@ -1,337 +1,435 @@
 '''
-Build4Good B4G Hold'em Pokerbot
+Improved pokerbot for B4G Hold'em variant
 '''
-import random
-import eval7 # Make sure eval7 is installed (pip install eval7)
-
 from skeleton.actions import FoldAction, CallAction, CheckAction, RaiseAction
 from skeleton.states import GameState, TerminalState, RoundState
 from skeleton.states import NUM_ROUNDS, STARTING_STACK, BIG_BLIND, SMALL_BLIND
 from skeleton.bot import Bot
 from skeleton.runner import parse_args, run_bot
 
+import random
+import eval7
+import time  # For performance tracking
+
+class QLearningAgent():
+    def __init__(self, epsilon=0.05, discount=0.80, alpha=0.2, numTraining=20, weights=False):
+        self.epsilon = epsilon
+        self.discount = discount
+        self.alpha = alpha
+        self.numTraining = numTraining
+        if weights == False:
+            self.weights = {}
+        else:
+            self.weights = weights
+
+    def getWeights(self):
+        return self.weights
+
+    def getLegalActions(self, state):
+        if state == False or state[1] == False:
+            return [CheckAction(), FoldAction(), CallAction()]
+        thisState = list(state)
+        game_state = thisState[0]
+        round_state = thisState[1]
+        active = thisState[2]
+        legal_actions = round_state.legal_actions()
+        myActions = []
+        my_pip = round_state.pips[active]
+        if RaiseAction in legal_actions:
+            min_raise, max_raise = round_state.raise_bounds()  # the smallest and largest numbers of chips for a legal bet/raise
+            min_cost = min_raise - my_pip  # the cost of a minimum bet/raise
+            max_cost = max_raise - my_pip  # the cost of a maximum bet/raise
+            myActions += [RaiseAction(min_raise + (max_raise - min_raise) * .1)]
+            myActions += [RaiseAction(min_raise + (max_raise - min_raise) * .5)]
+            myActions += [RaiseAction(min_raise + (max_raise - min_raise) * .8)]
+        if CheckAction in legal_actions:  # check-call
+            myActions += [CheckAction()]
+        if random.random() < 0.25:
+            myActions += [FoldAction()]
+        myActions += [CallAction()]
+        return myActions
+
+    def evaluateHandStrength(self, my_cards, board_cards, num_simulations=10):
+        """ 
+        Monte Carlo simulation to estimate hand strength using eval7.
+        Adapted for B4G Hold'em with 3 hole cards.
+        """
+        deck = [card for card in eval7.Deck() if str(card) not in my_cards + board_cards]
+        my_hand = [eval7.Card(str(c)) for c in my_cards]
+        board = [eval7.Card(str(c)) for c in board_cards]
+
+        wins = 0
+        for _ in range(num_simulations):
+            random.shuffle(deck)
+            # In B4G, opponent has 3 cards
+            opp_hand = deck[:3]
+            
+            # In B4G, we need to calculate the remaining board cards differently
+            # If no board cards yet, we'll add 4 community cards
+            # If we have some board cards, we'll add enough to make 4 total
+            remaining_board = deck[3:7 - len(board)]
+            
+            full_board = board + remaining_board
+            
+            # We need to find the best 5-card hand out of our 3 cards and the 4 community cards
+            my_best_hand_value = self.get_best_hand_value(my_hand, full_board)
+            opp_best_hand_value = self.get_best_hand_value(opp_hand, full_board)
+
+            if my_best_hand_value > opp_best_hand_value:
+                wins += 1
+
+        return wins / num_simulations  # Returns estimated win probability
+    
+    def get_best_hand_value(self, hole_cards, community_cards):
+        """
+        Find the best 5-card hand value from hole cards and community cards.
+        """
+        all_cards = hole_cards + community_cards
+        return eval7.evaluate(all_cards)
+
+    def getFeatures(self, state):
+        features = {}
+        if state == False or state[1] == False:
+            features["hand_strength"] = 0
+            features["pot_odds"] = 0
+            features["effective_stack"] = 0
+            features["opp_aggression"] = 0
+            features["position"] = 0
+            features["street"] = 0
+            features["bluff_potential"] = 0
+            return features
+        thisState = list(state)
+        game_state = thisState[0]
+        round_state = thisState[1]
+        active = thisState[2]
+
+        # 1. Hand Strength (calculated using hand evaluator)
+        my_cards = round_state.hands[active]
+        board_cards = round_state.deck[:round_state.street]  # Cards revealed so far
+        features["hand_strength"] = self.evaluateHandStrength(my_cards, board_cards)
+
+        # 2. Pot Odds
+        my_pip = round_state.pips[active]
+        opp_pip = round_state.pips[1 - active]
+        pot_size = sum(round_state.pips)
+        continue_cost = opp_pip - my_pip
+        features["pot_odds"] = continue_cost / (pot_size + continue_cost) if continue_cost > 0 else 0
+
+        # 3. Effective Stack Size (Relative to Big Blind)
+        my_stack = round_state.stacks[active]
+        features["effective_stack"] = my_stack / BIG_BLIND
+
+        # 4. Opponent's Betting Behavior (Aggression Factor)
+        opp_contribution = STARTING_STACK - round_state.stacks[1 - active]
+        features["opp_aggression"] = opp_contribution / (pot_size + 1)  # +1 to avoid division by zero
+
+        # 5. Position (1 if acting last, 0 if first)
+        features["position"] = 1 if active == 1 else 0
+
+        # 6. Street (adjusted for B4G: 0 = pre-flop, 1 = flop, 2 = final)
+        features["street"] = round_state.street / 4  # Normalize between 0 and 1
+
+        # 7. Bluff Potential (Simple metric: If opponent has checked, it might be a bluff spot)
+        features["bluff_potential"] = 1 if CheckAction in round_state.legal_actions() else 0
+
+        return features
+
+    def update(self, state, action, nextState, reward):
+        if self.numTraining > 0:
+            self.numTraining -= 1
+        else:
+            self.epsilon = 0
+        difference = reward + self.discount * self.computeValueFromQValues(nextState) - self.getQValue(state, action)
+        features = self.getFeatures(state)
+        for feature in features:
+            thisWeight = 0
+            if feature in self.weights:
+                thisWeight = self.weights[feature]
+            self.weights[feature] = thisWeight - self.alpha * difference * features[feature]
+
+    def getQValue(self, state, action):
+        features = self.getFeatures(state)
+        output = 0
+        for feature in features:
+            thisWeight = 0
+            if feature in self.weights:
+                thisWeight = self.weights[feature]
+            output += thisWeight * features[feature]
+        return output
+    
+    def computeActionFromQValues(self, state):
+        legalActions = [action for action in self.getLegalActions(state)]
+        if len(legalActions) == 0:
+            return None
+        else:
+            bestAction = [legalActions[0]]
+            bestActionScore = -9999999999999999999
+            for action in legalActions:
+                thisActionScore = self.getQValue(state, action)
+                if thisActionScore == bestActionScore:
+                    bestAction += [action]
+                elif thisActionScore > bestActionScore:
+                    bestActionScore = thisActionScore
+                    bestAction = [action]
+            if random.random() < self.epsilon:
+                return random.choice(legalActions)
+            return random.choice(bestAction)
+    
+    def computeValueFromQValues(self, state):
+        q_values = [self.getQValue(state, action) for action in self.getLegalActions(state)]
+        if len(q_values) == 0:
+            return 0.0
+        else:
+            return max(q_values)
+
+
 class Player(Bot):
     '''
     A pokerbot for B4G Hold'em.
     '''
-
+    
     def __init__(self):
         '''
         Called when a new game starts. Called exactly once.
+
+        Arguments:
+        Nothing.
+
+        Returns:
+        Nothing.
         '''
-        self.log_file = open("bot_log.txt", "w") # Optional: For debugging locally
-        self.log_file.write("Bot initialized\n")
-        self.log_file.flush()
+        self.previousAction = False
+        self.previousState = False
+        self.myAgent = QLearningAgent(numTraining=100)  # Increased training rounds
+        
+        # Statistics and debugging info
+        self.hand_counts = {'royal_flush': 0, 'straight_flush': 0, 'four_of_a_kind': 0, 
+                            'full_house': 0, 'flush': 0, 'straight': 0, 
+                            'three_of_a_kind': 0, 'two_pair': 0, 'pair': 0, 'high_card': 0}
+        self.total_hands = 0
+        self.wins = 0
+        self.losses = 0
+        
+        # Save start time to track performance
+        self.start_time = time.time()
+
+    def handle_new_round(self, game_state, round_state, active):
+        '''
+        Called when a new round starts. Called NUM_ROUNDS times.
+
+        Arguments:
+        game_state: the GameState object.
+        round_state: the RoundState object.
+        active: your player's index.
+
+        Returns:
+        Nothing.
+        '''
+        # We can use this to initialize per-round state
         pass
 
-    def __del__(self):
+    def handle_round_over(self, game_state, terminal_state, active):
         '''
-        Called when the bot is shutting down.
+        Called when a round ends. Called NUM_ROUNDS times.
+
+        Arguments:
+        game_state: the GameState object.
+        terminal_state: the TerminalState object.
+        active: your player's index.
+
+        Returns:
+        Nothing.
         '''
-        if self.log_file:
-            self.log_file.close()
-
-    def _log(self, message):
-        '''Helper function for logging'''
-        if self.log_file:
-            self.log_file.write(f"[Round {self.round_num}] {message}\n")
-            self.log_file.flush()
-
-    def _evaluate_preflop_strength(self, cards):
-        """
-        Simple heuristic for 3-card hand strength pre-flop.
-        Returns a strength value (higher is better).
-        """
-        ranks = sorted([c.rank for c in cards], reverse=True)
-        suits = [c.suit for c in cards]
-        is_suited = len(set(suits)) == 1
-        is_pair = ranks[0] == ranks[1] or ranks[1] == ranks[2]
-        is_trips = ranks[0] == ranks[1] == ranks[2]
-        is_connected = (ranks[0] == ranks[1] + 1) or (ranks[1] == ranks[2] + 1) or (ranks[0] == ranks[2] + 2) # Simple check
-        is_straight_draw = (ranks[0] == ranks[1] + 1 and ranks[1] == ranks[2] + 1) or \
-                           (ranks[0] == 12 and ranks[1] == 1 and ranks[2] == 0) # A23
+        thisGameState = (game_state, False, active)
+        if self.myAgent.numTraining > 0:
+            self.myAgent.update(self.previousState, self.previousAction, thisGameState, terminal_state.deltas[active])
         
-        strength = 0
-        
-        # Base strength from high cards (0-12 for 2-A)
-        strength += ranks[0] * 1.5 + ranks[1] * 1.0 + ranks[2] * 0.5
+        # Print weights occasionally for debugging
+        if game_state.round_num % 500 == 0:
+            print(f"Round {game_state.round_num}, Weights: {self.myAgent.getWeights()}")
 
-        if is_trips:
-            strength += 100 + ranks[0] * 3 # Trips are very strong
-        elif is_pair:
-            pair_rank = ranks[1] # The middle card is always part of the pair if one exists
-            strength += 50 + pair_rank * 2 # Pairs are good
-
-        if is_suited:
-            strength += 20
-            if is_straight_draw:
-                 strength += 30 # Suited connectors/gappers are strong
-            elif is_connected:
-                 strength += 15
-
-        elif is_straight_draw:
-            strength += 25 # Unsuited connectors/gappers
-        elif is_connected:
-            strength += 10
-
-        # Premium hands boost
-        if ranks[0] >= 10: # Ace, King, Queen, Jack high
-             strength += 5
-        if ranks[0] >= 10 and ranks[1] >= 9: # Two high cards
-             strength += 10
-
-        # Normalize slightly (rough estimate)
-        return strength / 200 # Aim for a value roughly between 0 and 1, can exceed 1 for monsters
-
-
-    def _get_hand_strength(self, my_cards, board_cards):
-        """
-        Evaluates hand strength using eval7.
-        Returns a score where higher is better. Handles different street lengths.
-        """
-        if not board_cards: # Pre-flop
-            hole_cards = [eval7.Card(c) for c in my_cards]
-            return self._evaluate_preflop_strength(hole_cards)
-
-        all_cards_str = my_cards + board_cards
-        all_cards = [eval7.Card(c) for c in all_cards_str]
-
-        # eval7.evaluate needs 5, 6, or 7 cards to find the best 5-card hand.
-        num_cards = len(all_cards)
-
-        if num_cards < 5:
-             # This shouldn't happen on flop (5) or turn (7) in B4G Hold'em
-             # If it does, we need a heuristic or return 0
-             self._log(f"Warning: Trying to evaluate less than 5 cards: {num_cards}")
-             return 0 # Or calculate potential based on hole + board? Needs more logic. For now, return 0.
-        elif num_cards > 7:
-             # This also shouldn't happen.
-             self._log(f"Warning: Trying to evaluate more than 7 cards: {num_cards}")
-             # Trim to 7? For now, use the first 7.
-             score = eval7.evaluate(all_cards[:7])
-        else:
-            score = eval7.evaluate(all_cards)
-
-        # eval7 returns a numerical score. Higher is better.
-        # We can normalize this score to a 0-1 range for easier thresholding.
-        # Max possible score (Royal Flush) is around 7462 according to some sources,
-        # but lets use a slightly higher number for normalization safety.
-        # Worst score (7 high) is 0.
-        # Let's use a practical scale based on observed values or poker knowledge.
-        # Straight Flush: ~7462+
-        # Quads: ~7452 - 7461
-        # Full House: ~7437 - 7451
-        # Flush: ~5863 - 7436
-        # Straight: ~4904 - 5862
-        # Three of a Kind: ~3426 - 4903
-        # Two Pair: ~1610 - 3425
-        # Pair: ~11 - 1609
-        # High Card: 0 - 10
-        # Using a simple linear scale up to Royal Flush might not be the best representation
-        # of practical strength differences. Let's try a rough normalization based on these tiers.
-        # A very rough normalization, needs refinement:
-        max_theoretical_score = 7500 # Adjust as needed
-        normalized_strength = score / max_theoretical_score
-        
-        # We could also return the rank class (e.g., eval7.HANDTYPE_NAMES[eval7.handtype(score)])
-        # rank_class = eval7.handtype(score) # 0=HIGH_CARD, 1=PAIR, ..., 8=STRAIGHT_FLUSH
-        
-        return normalized_strength # Return normalized score (0 to ~1)
-
-    def handle_new_round(self, game_state: GameState, round_state: RoundState, active: int):
+    def get_action(self, game_state, round_state, active):
         '''
-        Called when a new round starts.
+        Where the magic happens - your code should implement this function.
+        Called any time the engine needs an action from your bot.
+
+        Arguments:
+        game_state: the GameState object.
+        round_state: the RoundState object.
+        active: your player's index.
+
+        Returns:
+        Your action.
         '''
-        self.round_num = game_state.round_num
-        my_bankroll = game_state.bankroll
-        game_clock = game_state.game_clock
+        # Get our cards and the board cards
         my_cards = round_state.hands[active]
-        self.is_big_blind = bool(active)
-        self.is_small_blind = not self.is_big_blind
+        board_cards = round_state.deck[:round_state.street]
+        
+        # Check for premium hands that deserve special handling
+        hand_rank = self.evaluate_hand_rank(my_cards, board_cards)
+        
+        # Handle premium hands directly with optimal strategy
+        if hand_rank in ['royal_flush', 'straight_flush', 'four_of_a_kind', 'full_house']:
+            return self.play_premium_hand(round_state, hand_rank)
+        
+        # For regular hands, use our Q-learning agent
+        thisGameState = tuple([game_state, round_state, active])
+        
+        if self.myAgent.numTraining > 0 and self.previousState:
+            self.myAgent.update(self.previousState, self.previousAction, thisGameState, 0)
 
-        self._log(f"--- Starting Round {self.round_num} ---")
-        self._log(f"My cards: {my_cards}, Clock: {game_clock:.2f}s, Bankroll: {my_bankroll}")
-        self._log(f"Position: {'Big Blind' if self.is_big_blind else 'Small Blind'}")
-
-    def handle_round_over(self, game_state: GameState, terminal_state: TerminalState, active: int):
+        action = self.myAgent.computeActionFromQValues(thisGameState)
+        self.previousAction = action
+        self.previousState = thisGameState
+        
+        if isinstance(action, FoldAction):
+            return FoldAction()
+        elif isinstance(action, CallAction):
+            return CallAction()
+        elif isinstance(action, CheckAction):
+            return CheckAction()
+        elif isinstance(action, RaiseAction):
+            return RaiseAction(int(action.amount))
+            
+        # Fallback strategy (should not normally reach here)
+        legal_actions = round_state.legal_actions()
+        if CheckAction in legal_actions:
+            return CheckAction()
+        return CallAction()
+        
+    def evaluate_hand_rank(self, my_cards, board_cards):
         '''
-        Called when a round ends.
+        Evaluates the current hand rank (royal flush, straight flush, etc.)
+        
+        Arguments:
+        my_cards: List of my hole cards
+        board_cards: List of community cards
+        
+        Returns:
+        String describing the hand rank
         '''
-        my_delta = terminal_state.deltas[active]
-        previous_state = terminal_state.previous_state
-        street = previous_state.street
-        my_cards = previous_state.hands[active]
-        opp_cards = previous_state.hands[1-active]
-
-        self._log(f"--- Round {self.round_num} Over ---")
-        self._log(f"My cards: {my_cards}")
-        if opp_cards:
-            self._log(f"Opponent cards: {opp_cards}")
+        if not board_cards:
+            return 'high_card'  # Pre-flop
+            
+        # Convert cards to eval7 format
+        my_hand = [eval7.Card(str(c)) for c in my_cards]
+        board = [eval7.Card(str(c)) for c in board_cards]
+        all_cards = my_hand + board
+        
+        # Get the hand rank value
+        hand_value = eval7.evaluate(all_cards)
+        
+        # Map eval7 hand ranks to readable categories
+        # Royal flush is a special case of straight flush
+        if self.is_royal_flush(all_cards):
+            return 'royal_flush'
+        
+        # Use the hand value to determine rank
+        if 0x800000 <= hand_value <= 0x8FFFFF:  # Straight flush
+            return 'straight_flush'
+        elif 0x700000 <= hand_value <= 0x7FFFFF:  # Four of a kind
+            return 'four_of_a_kind'
+        elif 0x600000 <= hand_value <= 0x6FFFFF:  # Full house
+            return 'full_house'
+        elif 0x500000 <= hand_value <= 0x5FFFFF:  # Flush
+            return 'flush'
+        elif 0x400000 <= hand_value <= 0x4FFFFF:  # Straight
+            return 'straight'
+        elif 0x300000 <= hand_value <= 0x3FFFFF:  # Three of a kind
+            return 'three_of_a_kind'
+        elif 0x200000 <= hand_value <= 0x2FFFFF:  # Two pair
+            return 'two_pair'
+        elif 0x100000 <= hand_value <= 0x1FFFFF:  # Pair
+            return 'pair'
         else:
-             self._log(f"Opponent cards not revealed (Folded)")
-        self._log(f"Round ended on street {street}")
-        self._log(f"My bankroll change: {my_delta}")
-        self._log(f"Final Bankroll: {game_state.bankroll}")
-        self._log(f"Remaining Clock: {game_state.game_clock:.2f}s")
-
-
-    def get_action(self, game_state: GameState, round_state: RoundState, active: int):
+            return 'high_card'
+            
+    def is_royal_flush(self, cards):
         '''
-        This is the core function where the bot decides what action to take.
+        Check if the hand is a royal flush (A, K, Q, J, 10 of the same suit)
+        
+        Arguments:
+        cards: List of eval7.Card objects
+        
+        Returns:
+        Boolean indicating if the hand is a royal flush
+        '''
+        # Need at least 5 cards
+        if len(cards) < 5:
+            return False
+            
+        # Group cards by suit
+        suits = {}
+        for card in cards:
+            suit = card.suit
+            if suit not in suits:
+                suits[suit] = []
+            suits[suit].append(card.rank)
+            
+        # Check if any suit has A, K, Q, J, 10
+        for suit, ranks in suits.items():
+            if all(rank in ranks for rank in [14, 13, 12, 11, 10]):  # A=14, K=13, Q=12, J=11, 10=10
+                return True
+                
+        return False
+        
+    def play_premium_hand(self, round_state, hand_rank):
+        '''
+        Optimal strategy for premium hands
+        
+        Arguments:
+        round_state: the RoundState object
+        hand_rank: String describing the hand rank
+        
+        Returns:
+        Action to take
         '''
         legal_actions = round_state.legal_actions()
-        street = round_state.street # 0=preflop, 2=flop, 4=turn (final)
-        my_cards = round_state.hands[active]
-        board_cards = round_state.deck[:street] # Board cards are revealed based on street
-
-        my_pip = round_state.pips[active]
-        opp_pip = round_state.pips[1-active]
-        my_stack = round_state.stacks[active]
-        opp_stack = round_state.stacks[1-active]
-        pot_size = (STARTING_STACK - my_stack) + (STARTING_STACK - opp_stack)
-
-        continue_cost = opp_pip - my_pip
         
-        if RaiseAction in legal_actions:
-            min_raise, max_raise = round_state.raise_bounds()
-            min_cost = min_raise - my_pip
-            max_cost = max_raise - my_pip
-            can_raise = True
-        else:
-            min_raise, max_raise = (0,0) # Set defaults if cannot raise
-            min_cost, max_cost = (0,0)
-            can_raise = False
-
-        # --- Calculate Hand Strength ---
-        strength = self._get_hand_strength(my_cards, board_cards)
-        self._log(f"Street: {street}, My Hand: {my_cards}, Board: {board_cards}")
-        self._log(f"My Pip: {my_pip}, Opp Pip: {opp_pip}, My Stack: {my_stack}, Opp Stack: {opp_stack}")
-        self._log(f"Pot Size: {pot_size}, Continue Cost: {continue_cost}")
-        self._log(f"Calculated Strength: {strength:.4f}")
-        self._log(f"Legal Actions: {[a.__name__ for a in legal_actions]}")
-        if can_raise:
-             self._log(f"Raise Bounds: [{min_raise}, {max_raise}], Cost: [{min_cost}, {max_cost}]")
-
-
-        # --- Decision Logic ---
-
-        # Basic strategy thresholds (adjust these based on testing!)
-        # Strength is roughly normalized 0-1.
-        fold_threshold_preflop = 0.25
-        call_threshold_preflop = 0.45
-        raise_threshold_preflop = 0.70
-
-        fold_threshold_flop = 0.20 # Fold less post-flop if pot invested
-        call_threshold_flop = 0.40 # Value of Pair or better? Or good draw?
-        raise_threshold_flop = 0.65 # Two pair or better?
-
-        fold_threshold_turn = 0.20 # Final street, fold weak hands to bets
-        call_threshold_turn = 0.45 # Marginal made hands
-        raise_threshold_turn = 0.75 # Strong made hands (e.g., Two Pair+, sometimes strong Pair)
-
-
-        # Determine current thresholds based on street
-        if street == 0: # Pre-flop
-            fold_threshold = fold_threshold_preflop
-            call_threshold = call_threshold_preflop
-            raise_threshold = raise_threshold_preflop
-        elif street == 2: # Flop
-            fold_threshold = fold_threshold_flop
-            call_threshold = call_threshold_flop
-            raise_threshold = raise_threshold_flop
-        elif street == 4: # Turn (Final street)
-            fold_threshold = fold_threshold_turn
-            call_threshold = call_threshold_turn
-            raise_threshold = raise_threshold_turn
-        else: # Should not happen
-            self._log("Error: Unknown street number encountered!")
-            fold_threshold = 1.0 # Default to folding if something is wrong
-            call_threshold = 1.1
-            raise_threshold = 1.1
-
-        # --- Action Selection ---
-
-        # Raise Logic
-        if can_raise and strength >= raise_threshold:
-            # Determine raise amount
-            # Simple: raise somewhere between min and pot size (or max possible)
-            # Pot size raise: current pot + amount needed to call
-            pot_raise_amount = pot_size + continue_cost # Amount opponent needs to call if we make pot bet *after* calling
+        # Strategy depends on hand strength
+        if hand_rank == 'royal_flush' or hand_rank == 'straight_flush':
+            # With the nuts or near nuts, maximize value
+            if RaiseAction in legal_actions:
+                min_raise, max_raise = round_state.raise_bounds()
+                
+                # With monster hands, we want to extract maximum value
+                # If early in betting, make a small-medium raise to build pot
+                if round_state.street < 2:  # Pre-flop or flop
+                    # Raise 40% of max to build pot
+                    raise_amount = min_raise + int((max_raise - min_raise) * 0.4)
+                    return RaiseAction(raise_amount)
+                else:  # Final betting round
+                    # Go all-in on the last street to maximize value
+                    return RaiseAction(max_raise)
             
-            # Calculate the total bet size for a pot-sized raise
-            # Total amount = current pot + 2*opponent's last bet/raise (simplified)
-            # A simpler approximation: raise *by* pot size
-            raise_by_pot = pot_size
-            target_total_bet = my_pip + continue_cost + raise_by_pot # Amount to call + pot size
+            # If we can't raise, call
+            if CallAction in legal_actions:
+                return CallAction()
+            return CheckAction()
             
-            # Ensure target is within bounds and affordable
-            raise_amount = min(max_raise, target_total_bet) # Don't exceed max raise
-            raise_amount = max(min_raise, raise_amount) # Don't go below min raise
+        elif hand_rank == 'four_of_a_kind' or hand_rank == 'full_house':
+            # Very strong hands, but could be beaten
+            if RaiseAction in legal_actions:
+                min_raise, max_raise = round_state.raise_bounds()
+                
+                if round_state.street < 2:  # Pre-flop or flop
+                    # Make a medium-sized raise
+                    raise_amount = min_raise + int((max_raise - min_raise) * 0.6)
+                    return RaiseAction(raise_amount)
+                else:  # Final betting round
+                    # Strong bet but not necessarily all-in
+                    raise_amount = min_raise + int((max_raise - min_raise) * 0.8)
+                    return RaiseAction(raise_amount)
             
-            # Ensure we don't bet more than our stack allows (max_raise should handle this, but double check)
-            actual_raise_cost = raise_amount - my_pip
-            if actual_raise_cost > my_stack:
-                 raise_amount = my_pip + my_stack # All-in
-
-            # Sanity check amount is still valid
-            if min_raise <= raise_amount <= max_raise:
-                 self._log(f"ACTION: Raise to {raise_amount} (Strength: {strength:.4f} >= {raise_threshold:.4f})")
-                 return RaiseAction(raise_amount)
-            else: # Fallback to min raise if calculation is weird or max raise if strong
-                 self._log(f"ACTION: Raise MIN {min_raise} (Strength: {strength:.4f} >= {raise_threshold:.4f}, calc issue)")
-                 # Or maybe raise max if very strong?
-                 if strength > raise_threshold + 0.1:
-                     self._log(f"ACTION: Raise MAX {max_raise} (Very Strong: {strength:.4f})")
-                     return RaiseAction(max_raise)
-                 return RaiseAction(min_raise)
-
-
-        # Call / Check Logic
-        if CheckAction in legal_actions: # Opponent has not bet, or BB option preflop
-             if strength >= call_threshold: # Check if decent hand, maybe bet later
-                 self._log(f"ACTION: Check (Strength: {strength:.4f} >= {call_threshold:.4f})")
-                 return CheckAction()
-             else: # Check if weak hand, hope to see next card free
-                 self._log(f"ACTION: Check (Strength: {strength:.4f} < {call_threshold:.4f})")
-                 return CheckAction()
-
-        if CallAction in legal_actions: # Opponent has bet
-             if strength >= call_threshold:
-                 # Potentially add pot odds check here later for drawing hands
-                 self._log(f"ACTION: Call (Strength: {strength:.4f} >= {call_threshold:.4f}, Cost: {continue_cost})")
-                 return CallAction()
-             # If strength is below call but above fold, consider calling small bets?
-             # Pot odds = amount to call / (pot size + amount to call)
-             # Required equity = pot odds
-             # if strength > fold_threshold and (continue_cost / (pot_size + continue_cost)) < strength: # Very rough pot odds check
-             #    self._log(f"ACTION: Call based on pot odds (Strength: {strength:.4f}, Cost: {continue_cost})")
-             #    return CallAction()
-
-
-        # Fold Logic
-        if FoldAction in legal_actions:
-            # Fold if strength is below threshold and we can't check
-            if strength < fold_threshold or continue_cost > my_stack: # Also fold if we can't afford to call
-                self._log(f"ACTION: Fold (Strength: {strength:.4f} < {fold_threshold:.4f} or cannot afford call)")
-                return FoldAction()
-            else:
-                # If we didn't meet call/raise threshold but are above fold threshold,
-                # and CallAction is available, we should Call (this case handles the gap)
-                if CallAction in legal_actions:
-                    self._log(f"ACTION: Call (Fallback - Strength {strength:.4f} between fold/call thresholds)")
-                    return CallAction()
-                else:
-                    # This state should ideally not be reached if logic is correct
-                    # (e.g., facing an all-in we can't call/raise over, but don't want to fold)
-                    # But if it does, Fold is the safest default if Check/Call aren't options.
-                     self._log(f"ACTION: Fold (Fallback - Unable to Check/Call/Raise)")
-                     return FoldAction()
-
-        # Final fallback if no other action chosen (should not happen with proper logic)
-        self._log("ACTION: Fold (ERROR - Default Fallback)")
-        return FoldAction()
+            if CallAction in legal_actions:
+                return CallAction()
+            return CheckAction()
+            
+        # This shouldn't be reached, but just in case
+        if CheckAction in legal_actions:
+            return CheckAction()
+        return CallAction()
 
 
 if __name__ == '__main__':
     run_bot(Player(), parse_args())
-# ----------------------------------------
